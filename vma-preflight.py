@@ -61,6 +61,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
+from pyVmomi import vim, vmodl
+from pyVim.connect import SmartConnect, Disconnect
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +86,12 @@ _section = ""
 def _record(name: str, status: str, detail: str = "") -> None:
     RESULTS.append((_section, name, status, detail))
     tag = {
-        "PASS": f"{C.GRN}[PASS]{C.RST}",
-        "FAIL": f"{C.RED}[FAIL]{C.RST}",
-        "WARN": f"{C.YLW}[WARN]{C.RST}",
-        "SKIP": f"{C.CYN}[SKIP]{C.RST}",
-        "PLAN": f"{C.MAG}[PLAN]{C.RST}",
-        "DONE": f"{C.GRN}[DONE]{C.RST}",
+        "PASS": f"✅ {C.GRN}[PASS]{C.RST}",
+        "FAIL": f"❌ {C.RED}[FAIL]{C.RST}",
+        "WARN": f"⚠  {C.YLW}[WARN]{C.RST}",
+        "SKIP": f"⏭️ {C.CYN}[SKIP]{C.RST}",
+        "PLAN": f"🚧 {C.MAG}[PLAN]{C.RST}",
+        "DONE": f"⚡ {C.GRN}[DONE]{C.RST}",
     }[status]
     line = f"  {tag} {name}"
     if detail:
@@ -177,24 +179,6 @@ V2V_UNSUPPORTED_GUESTID_PREFIXES: Tuple[str, ...] = (
     "otherLinux", "other", "other24xLinux", "other26xLinux", "other3xLinux",
 )
 
-
-def guest_v2v_status(guest_id: str) -> Tuple[str, str]:
-    """Return ('PASS'|'WARN'|'FAIL', explanation)."""
-    if not guest_id:
-        return "WARN", "guestId not set on the VM"
-    gid_lower = guest_id.lower()
-    for bad in V2V_UNSUPPORTED_GUESTID_PREFIXES:
-        if gid_lower.startswith(bad.lower()):
-            return "FAIL", f"guestId '{guest_id}' is on the virt-v2v unsupported list"
-    for good in V2V_SUPPORTED_GUESTID_PREFIXES:
-        if gid_lower.startswith(good.lower()):
-            return "PASS", f"guestId '{guest_id}' is supported by virt-v2v"
-    return "WARN", (
-        f"guestId '{guest_id}' is not on the known-supported list; verify against "
-        f"https://libguestfs.org/virt-v2v-support.1.html before scheduling migration"
-    )
-
-
 # ---------------------------------------------------------------------------
 # vCenter version -> virt-v2v compatibility (SpectroCloud VMA: 7.0 / 8.0)
 # ---------------------------------------------------------------------------
@@ -270,9 +254,6 @@ def parse_endpoint(endpoint: str) -> Tuple[str, int]:
 # vCenter connection helper (shared by preflight / allvms / windows modes)
 # ---------------------------------------------------------------------------
 def connect_vcenter(host, port, user, password, insecure, timeout):
-    from pyVim.connect import SmartConnect
-    from pyVmomi import vim, vmodl
-
     ssl_ctx = ssl._create_unverified_context() if insecure else ssl.create_default_context()
     old_timeout = socket.getdefaulttimeout()
     socket.setdefaulttimeout(max(timeout, 15.0))
@@ -300,7 +281,6 @@ def connect_vcenter(host, port, user, password, insecure, timeout):
 
 
 def find_vm(content, name):
-    from pyVmomi import vim
     view = content.viewManager.CreateContainerView(
         content.rootFolder, [vim.VirtualMachine], True
     )
@@ -325,7 +305,6 @@ def find_inventory_object(content, path: str):
     Returns the managed object (Folder, Datacenter, ClusterComputeResource,
     HostSystem, ResourcePool, ...) or None if nothing matched.
     """
-    from pyVmomi import vim
     # 1) Exact inventory path lookup (fastest / most specific)
     try:
         obj = content.searchIndex.FindByInventoryPath(path)
@@ -376,7 +355,6 @@ def _inventory_path_of(obj) -> str:
 
 def _get_vm_parent_folder(vm):
     """Walk up from a VM to its nearest Folder parent (skipping vApp etc.)."""
-    from pyVmomi import vim
     cur = getattr(vm, "parent", None)
     while cur is not None:
         if isinstance(cur, vim.Folder):
@@ -392,7 +370,6 @@ def check_vcenter_preflight(
     host, port, user, password, insecure, vm_names, timeout,
     folder_paths=None, per_vm_privs=False,
 ) -> Optional[List[str]]:
-    from pyVim.connect import Disconnect
 
     head("A. vCenter connectivity & authentication")
     si, err = connect_vcenter(host, port, user, password, insecure, timeout)
@@ -436,7 +413,6 @@ def _check_privileges(content, vm_names, folder_paths=None, per_vm_privs=False):
     Entities with identical 'missing privileges' sets are collapsed into a
     single output group so a role gap shared by N VMs lists the gap ONCE.
     """
-    from pyVmomi import vim
 
     auth_mgr = content.authorizationManager
     session_mgr = content.sessionManager
@@ -551,7 +527,6 @@ def _check_privileges(content, vm_names, folder_paths=None, per_vm_privs=False):
 
 
 def _discover_esxi_hosts(content, vm_names):
-    from pyVmomi import vim
     hosts: set[str] = set()
     view = content.viewManager.CreateContainerView(
         content.rootFolder, [vim.VirtualMachine], True
@@ -632,8 +607,6 @@ def check_ports(targets, timeout):
 # ===========================================================================
 def run_allvms_checks(host, port, user, password, insecure, vm_names, timeout):
     """vSphere-side pre-migration checks that apply to every VM regardless of OS."""
-    from pyVim.connect import Disconnect
-    from pyVmomi import vim
 
     head("F. vCenter version compatibility (virt-v2v)")
     si, err = connect_vcenter(host, port, user, password, insecure, timeout)
@@ -653,11 +626,14 @@ def run_allvms_checks(host, port, user, password, insecure, vm_names, timeout):
             vm = find_vm(content, name)
             if vm is None:
                 FAIL(f"Locate VM '{name}'", "not found in vCenter inventory"); continue
-            print(f"\n  {C.BLD}VM: {name}{C.RST}")
+            print(f"\n  {C.BLD}VM: {name} | Config: {vm.summary.config.numCpu} CPU, {vm.summary.config.memorySizeMB} MB, {vm.runtime.powerState} {C.RST}")
+
             _vm_check_guest_os(vm)
             _vm_check_tools(vm)
             _vm_check_snapshots(vm)
             _vm_check_boot(vm)
+            _vm_check_vtpm(vm)
+            _vm_check_datastore(vm)
             _vm_check_cdrom_and_disks(vm)
             _vm_check_network(vm, content)
     finally:
@@ -670,11 +646,39 @@ def run_allvms_checks(host, port, user, password, insecure, vm_names, timeout):
 def _vm_check_guest_os(vm) -> None:
     gid = getattr(vm.config, "guestId", "") or getattr(vm.summary.config, "guestId", "")
     gfull = getattr(vm.config, "guestFullName", "") or getattr(vm.summary.config, "guestFullName", "")
-    status, msg = guest_v2v_status(gid)
-    label = f"[{vm.name}] Guest OS"
-    detail = f"{gid} ({gfull}) — {msg}" if gfull else f"{gid} — {msg}"
-    _record(label, status, detail)
+    label = f"[{vm.name}] Guest OS ({gid} | {gfull})"
 
+    if not gid:
+        WARN(label, "guestId not set on the VM")
+
+    gid_lower = gid.lower()
+
+    for bad in V2V_UNSUPPORTED_GUESTID_PREFIXES:
+        if gid_lower.startswith(bad.lower()):
+            FAIL(label, f" is on the virt-v2v unsupported list")
+            return
+    
+    for good in V2V_SUPPORTED_GUESTID_PREFIXES:
+        if gid_lower.startswith(good.lower()):
+            PASS(label, f" is supported by virt-v2v")
+            return
+
+    WARN(label, f" is not listed: https://libguestfs.org/virt-v2v-support.1.html")
+
+def _vm_check_vtpm(vm) -> None:
+    label = f"[{vm.name}] vTPM"
+
+    tpm_found = False
+    if vm.config and vm.config.hardware:
+        for device in vm.config.hardware.device:
+            # Check if the device object is an instance of vim.vm.device.VirtualTPM
+            if isinstance(device, vim.vm.device.VirtualTPM):
+                tpm_found = True
+                WARN(label, f"[TPM FOUND] VM '{vm.name}' has a vTPM device enabled.")
+                break
+
+    if not tpm_found:
+        PASS(label, f"[NO TPM FOUND] in VM '{vm.name}'")
 
 def _vm_check_tools(vm) -> None:
     g = vm.guest
@@ -684,34 +688,54 @@ def _vm_check_tools(vm) -> None:
     label = f"[{vm.name}] VMware Tools"
 
     if tools_status == "toolsOk" and tools_running == "guestToolsRunning":
-        PASS(label, f"running, version {tools_version}")
+        WARN(label, f"running, version {tools_version}")
     elif tools_status == "toolsOld":
-        WARN(label, f"installed but out of date (version {tools_version}); migration will still work, but consider upgrading")
+        WARN(label, f"installed but out of date (version {tools_version})")
     elif tools_status == "toolsNotRunning":
         WARN(label, "installed but not running; some in-guest checks and warm migration features will be limited")
     elif tools_status == "toolsNotInstalled":
-        FAIL(label, "not installed — warm migration and guest info discovery require VMware Tools / open-vm-tools")
+        PASS(label, "not installed")
     else:
         WARN(label, f"toolsStatus={tools_status}, toolsRunningStatus={tools_running}")
 
 
 def _vm_check_snapshots(vm) -> None:
     label = f"[{vm.name}] Snapshots"
-    if vm.snapshot is None:
-        PASS(label, "no active snapshots"); return
 
-    def _count(tree):
-        n = 0
-        for s in tree:
-            n += 1 + _count(s.childSnapshotList)
-        return n
+    try:
+        if vm.snapshot is None:
+            PASS(label, "no active snapshots"); return
 
-    total = _count(vm.snapshot.rootSnapshotList)
-    FAIL(label, f"{total} snapshot(s) present — consolidate or remove before migrating (virt-v2v requires a snapshot-free chain)")
+        def _count(tree):
+            n = 0
+            for s in tree:
+                n += 1 + _count(s.childSnapshotList)
+            return n
 
+        total = _count(vm.snapshot.rootSnapshotList)
+        FAIL(label, f"{total} snapshot(s) present — consolidate or remove before migrating (virt-v2v requires a snapshot-free chain)")
+
+    except Exception as e: 
+        WARN(label, f"{type(e).__name__}: {e}")
+        return None
+
+def _vm_check_datastore(vm) -> None:
+    label = f"[{vm.name}] Datastores"
+
+    try:
+        if len(vm.datastore)>1:
+            WARN(label, str(len(vm.datastore)) + " datastore found")
+        else:
+            PASS(label, str(len(vm.datastore)) + " datastore found")
+
+        for datastore in vm.datastore:
+            print(f"      ℹ  {datastore.name} Free: {datastore.summary.freeSpace / 1024**3:.2f} GB Capacity: {datastore.summary.capacity / 1024**3:.2f} GB")
+
+    except Exception as e:
+        WARN(label, f"{type(e).__name__}: {e}")
+        return None
 
 def _vm_check_boot(vm) -> None:
-    from pyVmomi import vim
     cfg = vm.config
     firmware = getattr(cfg, "firmware", "bios") or "bios"
     boot = getattr(cfg, "bootOptions", None)
@@ -754,7 +778,6 @@ def _vm_check_boot(vm) -> None:
 
 
 def _vm_check_cdrom_and_disks(vm) -> None:
-    from pyVmomi import vim
     cdroms_mounted: List[str] = []
     ide_disks: List[str] = []
     rdm_disks: List[str] = []
@@ -810,7 +833,6 @@ def _vm_check_cdrom_and_disks(vm) -> None:
 
 
 def _vm_check_network(vm, content) -> None:
-    from pyVmomi import vim
     nics = [d for d in vm.config.hardware.device if isinstance(d, vim.vm.device.VirtualEthernetCard)]
     label = f"[{vm.name}] NICs"
     if not nics:
@@ -865,11 +887,11 @@ def _vm_check_network(vm, content) -> None:
     if problems:
         FAIL(label, "; ".join(problems))
         for i in infos:
-            print(f"      • {i}")
+            print(f"      ℹ  {i}")
     else:
         PASS(label, f"{len(nics)} NIC(s)")
         for i in infos:
-            print(f"      • {i}")
+            print(f"      ℹ  {i}")
 
 
 # ===========================================================================
@@ -879,8 +901,6 @@ def run_windows_checks(
     host, port, user, password, insecure, vm_names, timeout,
     win_user, win_password, win_auth, win_transport, win_port, apply_changes,
 ):
-    from pyVim.connect import Disconnect
-    from pyVmomi import vim
 
     head("H. Windows VM pre-migration checks + prep")
     if not vm_names:
@@ -1134,7 +1154,6 @@ def _win_check_secure_boot(session, vm_name, vm):
     label = f"[{vm_name}] Secure Boot (guest view)"
     rc, out, err = _run_ps(session, r'try { (Confirm-SecureBootUEFI).ToString() } catch { "NA" }')
     val = out.strip().splitlines()[-1] if out.strip() else ""
-    from pyVmomi import vim
     firmware = getattr(vm.config, "firmware", "bios") or "bios"
     vsphere_sb = bool(getattr(vm.config.bootOptions, "efiSecureBootEnabled", False)) if vm.config.bootOptions else False
 
@@ -1604,15 +1623,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=5.0, help="Per-connection timeout (default 5s).")
 
     # Windows guest args
-    p.add_argument("--win-user", help="Windows guest username for WinRM (e.g. Administrator).")
-    p.add_argument("--win-password", help="Windows guest password. Prefers env WIN_PASSWORD; prompts if neither.")
-    p.add_argument("--win-auth", choices=("ntlm", "basic", "kerberos", "credssp"), default="ntlm",
+    win_group = p.add_argument_group("Windows Options")
+    win_group.add_argument("--win-user", help="Windows guest username for WinRM (e.g. Administrator).")
+    win_group.add_argument("--win-password", help="Windows guest password. Prefers env WIN_PASSWORD; prompts if neither.")
+    win_group.add_argument("--win-auth", choices=("ntlm", "basic", "kerberos", "credssp"), default="ntlm",
                    help="WinRM auth mechanism (default ntlm).")
-    p.add_argument("--win-transport", choices=("http", "https"), default="http",
+    win_group.add_argument("--win-transport", choices=("http", "https"), default="http",
                    help="WinRM transport (default http, port 5985).")
-    p.add_argument("--win-port", type=int, default=None,
+    win_group.add_argument("--win-port", type=int, default=None,
                    help="WinRM port (default 5985 for http, 5986 for https).")
-    p.add_argument("--apply", action="store_true",
+    win_group.add_argument("--apply", action="store_true",
                    help="Actually apply Windows changes (default is dry-run).")
     return p
 
@@ -1725,12 +1745,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 check_dns(names)
             else:
                 head("D. DNS resolution"); SKIP("DNS resolution", "no targets")
+        else:
+            head("D. DNS resolution"); SKIP("DNS resolution", "SKIPPED")
 
         if not args.skip_ports:
             targets: List[Tuple[str, int]] = []
             if vcenter_host: targets.append((vcenter_host, vcenter_port or 443))
             for h in esxi_hosts: targets.append((h, 902))
             check_ports(targets, args.timeout)
+        else:
+            head("E.TCP port reachability (timeout 5s) "); SKIP("TCP port test", "SKIPPED")
 
     if mode in ("allvms", "all"):
         run_allvms_checks(
@@ -1756,3 +1780,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
